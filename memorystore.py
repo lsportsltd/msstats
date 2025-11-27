@@ -14,7 +14,12 @@ For each node (instance node or cluster node), the script outputs a CSV row cont
   BytesUsedForCache, MaxMemory, and the command-category columns from msstats.py.
 
 Usage:
+  # Using user account (Application Default Credentials):
+  python memorystore.py --project YOUR_PROJECT_ID --out /path/to/out.csv
+  
+  # Using service account:
   python memorystore.py --project YOUR_PROJECT_ID --credentials /path/to/sa.json --out /path/to/out.csv
+
 Optional:
   --duration 604800   # lookback window in seconds (default 7 days)
   --step 60           # alignment step in seconds for rate metrics (default 60)
@@ -30,6 +35,7 @@ from collections import defaultdict
 
 from google.oauth2 import service_account
 from google.cloud import monitoring_v3
+import google.auth.exceptions
 
 # Import the categorization logic from the provided msstats.py
 # We rely on these to compute the exact same metrics/categories.
@@ -309,6 +315,7 @@ def collect_for_product(
     metric_map: Dict[str, str],
     instance_type_label: str,
 ) -> List[Dict[str, Any]]:
+    print(f"  Collecting {instance_type_label} metrics...")
     project_name = f"projects/{project_id}"
     interval = _time_interval(duration)
     agg = _make_rate_aggregation(step)
@@ -316,6 +323,7 @@ def collect_for_product(
     table: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     # Commands (primary discovery)
+    print(f"    Querying {metric_map['commands']}...")
     try:
         cmd_results = _list_ts(
             client,
@@ -331,6 +339,7 @@ def collect_for_product(
 
     # If nothing found, discover via memory usage series (so we still emit rows)
     if not table:
+        print(f"    Querying {metric_map['memory_usage']} (discovery)...")
         try:
             mem_results = _list_ts(
                 client, project_name, metric_map["memory_usage"], interval
@@ -344,6 +353,7 @@ def collect_for_product(
                 entry["Project ID"] = project_id
 
     # Memory usage (BytesUsedForCache)
+    print(f"    Querying {metric_map['memory_usage']}...")
     try:
         mem_results = _list_ts(
             client, project_name, metric_map["memory_usage"], interval
@@ -353,6 +363,7 @@ def collect_for_product(
         pass
 
     # Capacity (MaxMemory) - instance/cluster level
+    print(f"    Querying {metric_map['max_memory']}...")
     try:
         cap_results = _list_ts(client, project_name, metric_map["max_memory"], interval)
         _attach_capacity_scalar(cap_results, table, key_name="MaxMemory")
@@ -363,7 +374,12 @@ def collect_for_product(
     _apply_processed_categories(table)
 
     # Flatten to rows
-    return _flatten_rows(table, project_id, instance_type_label)
+    rows = _flatten_rows(table, project_id, instance_type_label)
+    if rows:
+        num_instances = len(table)
+        num_nodes = sum(len(nodes) for nodes in table.values())
+        print(f"    Found {num_instances} instance(s) with {num_nodes} node(s)")
+    return rows
 
 
 def main():
@@ -373,8 +389,8 @@ def main():
     parser.add_argument("--project", required=True, help="GCP Project ID")
     parser.add_argument(
         "--credentials",
-        required=True,
-        help="Path to service account JSON with monitoring.viewer",
+        required=False,
+        help="Path to service account JSON with monitoring.viewer (optional; uses Application Default Credentials if not provided)",
     )
     parser.add_argument("--out", required=True, help="Output CSV file path")
     parser.add_argument(
@@ -391,9 +407,29 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"Starting Memorystore metrics collection")
+    print(f"Project: {args.project}")
+    print(f"Duration: {args.duration} seconds ({args.duration // 86400} days)")
+    print(f"Auth: {'Service Account' if args.credentials else 'Application Default Credentials'}")
+    print()
+
     # Auth
-    creds = service_account.Credentials.from_service_account_file(args.credentials)
-    client = monitoring_v3.MetricServiceClient(credentials=creds)
+    if args.credentials:
+        creds = service_account.Credentials.from_service_account_file(args.credentials)
+        client = monitoring_v3.MetricServiceClient(credentials=creds)
+    else:
+        # Use Application Default Credentials (user account or other)
+        try:
+            client = monitoring_v3.MetricServiceClient()
+        except google.auth.exceptions.DefaultCredentialsError:
+            print("Error: No credentials found.")
+            print("\nTo authenticate, you have two options:")
+            print("1. Provide a service account key file:")
+            print("   python memorystore.py --project YOUR_PROJECT --credentials /path/to/sa.json --out output.csv")
+            print("\n2. Set up Application Default Credentials (user account):")
+            print("   gcloud auth application-default login")
+            print("   Then run: python memorystore.py --project YOUR_PROJECT --out output.csv")
+            sys.exit(1)
 
     all_rows: List[Dict[str, Any]] = []
 
@@ -408,8 +444,11 @@ def main():
         )
         all_rows.extend(rows)
 
+    print()
     if not all_rows:
         print("Warning: No metrics found; CSV will be created with no rows.")
+    else:
+        print(f"Total rows collected: {len(all_rows)}")
 
     # Build header: union of keys across rows, with useful columns first
     base_order = [
@@ -434,6 +473,7 @@ def main():
     header = base_order + category_keys
 
     # Write CSV
+    print(f"\nWriting results to {args.out}...")
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=header)
@@ -441,7 +481,7 @@ def main():
         for row in all_rows:
             writer.writerow(row)
 
-    print(f"Wrote {len(all_rows)} rows to {args.out}")
+    print(f"Successfully wrote {len(all_rows)} rows to {args.out}")
 
 
 if __name__ == "__main__":
